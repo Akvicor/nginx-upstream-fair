@@ -1,8 +1,39 @@
 # ngx_http_upstream_fair_module
 
-按后端当前忙闲分配请求：正在处理请求较多的后端少分，空闲后端多分。来源为 Debian `libnginx-mod-http-upstream-fair`（上游 `0.0~git20120408.a18b409`），并已应用 Debian 补丁以支持动态模块、OpenSSL 1.1+ 和 nginx 1.11.6+。
+<p align="center">
+  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
+</p>
 
-## 使用
+[Blog](https://www.ksyaki.com/archives/nginx-fu-zai-jun-heng-mo-kuai)
+
+A busy-aware upstream load balancer for Nginx: backends handling more in-flight requests receive fewer new requests, while idle backends receive more. This tree is based on Debian `libnginx-mod-http-upstream-fair` (upstream `0.0~git20120408.a18b409`) and includes Debian patches for dynamic module builds, OpenSSL 1.1+, and Nginx 1.11.6+.
+
+## Differences from Upstream
+
+Compared with the original `a18b409` tree, this maintained version:
+
+- Applies Debian compatibility patches for dynamic module builds, OpenSSL 1.1+, and Nginx 1.11.6+.
+- Adds optional integration with [nginx-healthcheck-module](https://github.com/Akvicor/nginx-healthcheck-module) for active peer health filtering.
+- Splits peer and group state into the `peers` module and hardens primary/backup group selection.
+- Fixes request accounting and free lifecycle handling so counters, tried bitmaps, failure reports, and SSL sessions belong to the actually selected group.
+- Keeps required counters and routing rules active without `--with-debug`, and publishes runtime state through Nginx's native configuration commit callback.
+
+## Build
+
+```bash
+git clone https://github.com/nginx/nginx.git
+git clone https://github.com/Akvicor/nginx-upstream-fair.git
+
+cd nginx
+git checkout release-1.26.3
+./auto/configure --add-module=../nginx-upstream-fair
+make
+make install
+```
+
+Use `--add-dynamic-module=../nginx-upstream-fair` instead when a dynamic module build is needed.
+
+## Usage
 
 ```nginx
 upstream backend {
@@ -13,23 +44,19 @@ upstream backend {
 }
 ```
 
-## 指令与调度
+## Directives and Scheduling
 
 ```nginx
 fair [no_rr] [weight_mode=idle|weight_mode=peak];
 ```
 
-- 默认模式结合当前在用请求、请求分配历史和权重选择后端；优先空闲候选，
-  其余合格候选参与 busy 评分。
-- `no_rr` 控制既有的轮转游标策略，可与两种 weight_mode 配合。
-- `weight_mode=idle` 在 idle 选择时将 weight 作为在用请求参考界限，随后仍可
-  进入 busy 选择；配合 no_rr 时沿用对已轻载节点的既有偏好。
-- `weight_mode=peak` 将 weight 作为多节点选择的并发容量上限；有备组时，
-  容量已满的主组可以进入备组。真正单节点且无备组保留既有单节点特例。
-- `upstream_fair_shm_size size;` 位于 `http`，默认和最小值为 8 个系统页，
-  按页对齐；修改已有共享区大小需要重启。
+- The default mode selects a backend using in-flight requests, assignment history, and weights. Idle candidates are preferred; other eligible candidates participate in busy scoring.
+- `no_rr` controls the existing round-robin cursor policy and can be combined with either weight mode.
+- `weight_mode=idle` uses weight as the in-flight reference bound during idle selection; a peer can still enter busy selection afterwards. With `no_rr`, the existing preference for lightly loaded peers is preserved.
+- `weight_mode=peak` treats weight as the concurrent request capacity when multiple peers are available. When a backup group exists, a full primary group can overflow into the backup group. The existing single-peer special case is preserved when there is exactly one peer and no backup group.
+- `upstream_fair_shm_size size;` is configured in `http`. Its default and minimum value is eight system pages, and the configured value is page-aligned. Restart Nginx to resize an existing shared memory zone.
 
-## 主备与主动健康检查
+## Primary/Backup Groups and Active Health Checks
 
 ```nginx
 upstream backend {
@@ -42,34 +69,43 @@ upstream backend {
 }
 ```
 
-`check` 来自 [nginx-healthcheck-module](https://github.com/Akvicor/nginx-healthcheck-module)，
-通过共同静态构建提供。显式 upstream 内主、备两组所有非静态 down 地址各自注册检查，
-排序后检查索引仍与地址对应；配置了检查却注册失败会拒绝本次加载。
+The `check` directive is provided by [nginx-healthcheck-module](https://github.com/Akvicor/nginx-healthcheck-module) through a joint static build. All non-static-down addresses in the primary and backup groups of an explicit upstream are registered for checks. Sorted check indexes still correspond to their addresses; if checks are configured but registration fails, the configuration load is rejected.
 
-每个新请求从主组开始，主组没有合格候选时才进入备组。普通模式下主节点忙碌仍参与
-主组评分；已有请求进入备组后在该组继续重试，新请求在主节点恢复合格后重新优先主组。
-`proxy_next_upstream` 的次数等限制继续由原生请求生命周期执行。
-配置至少保留一个主节点，主节点可以静态 down；只有 backup 节点的配置会加载失败。
+Each new request starts in the primary group and enters the backup group only when the primary group has no eligible candidate. In normal mode, busy primary peers still participate in primary-group scoring. A request that has entered the backup group continues retrying within that group; after a primary peer becomes eligible again, new requests prefer the primary group. Native request lifecycle handling continues to enforce limits such as `proxy_next_upstream`.
 
-静态 down、主动 down、被动失败冷却和请求 tried 分别参与资格判断。主动恢复 up
-只更新主动健康，业务仍须满足被动冷却；主备全部耗尽保留被动 fails。
-无备组的旧耗尽处理、真单节点的被动特例继续沿用；真单节点同样过滤静态和主动 down。
-fair-only 构建提供相同的主备与忙闲调度，配置示例省略来自 healthcheck 的 `check` 即可。
+At least one primary peer must be configured. A primary peer may be statically down, but a configuration containing only backup peers fails to load.
 
-## 计数与生命周期
+Static down, active down, passive failure cooldown, and request tried state each participate in eligibility checks. Active recovery to up updates only active health; traffic still has to satisfy passive cooldown. When both primary and backup candidates are exhausted, passive fail counts are preserved. The legacy no-backup exhaustion path and true single-peer passive special case remain unchanged; a true single peer is still filtered by static and active down state. A fair-only build provides the same primary/backup and busy-aware scheduling behavior; omit the healthcheck module's `check` directive in that configuration.
 
-实际选中及归还分别增减 peer 的 `nreq` 和所属组的 `total_nreq`，包含连接尝试阶段；
-重复 free 幂等。位图、失败回报、SSL session 和统计始终属于实际选中的组与 peer。
-旧 generation 统计块在原有遍历入口检查在用数量，非零时保留。
+## Counters and Lifecycle
 
-必要计数和所有选路规则在带/不带 `--with-debug` 时都执行，运行日志级别只控制诊断。
-`--with-debug` 与编译器的优化级别、`-g` 调试符号是独立设置。
-共享区运行入口在 Nginx 原生配置提交回调中发布；加载失败保持旧入口，重生 worker
-继续使用有效配置，成功 reload 的旧请求按原生规则排空。
+Selecting and returning a peer increments or decrements the peer's `nreq` and its group's `total_nreq`, including the connection attempt phase. Repeated free operations are idempotent. Bitmap state, failure reports, SSL sessions, and statistics always belong to the actually selected group and peer. Old generation statistic blocks are checked through the existing traversal entry and retained while their in-use count is non-zero.
 
-## 构建与验证
+Required counters and all routing rules run with or without `--with-debug`; runtime log levels only control diagnostics. `--with-debug`, compiler optimization level, and `-g` debug symbols are independent settings.
 
-`config` 保留既有静态/动态接入。主动检查联合支持以与
-[nginx-healthcheck-module](https://github.com/Akvicor/nginx-healthcheck-module) 的共同静态构建为准；
-`NGX_HTTP_UPSTREAM_CHECK` 隔离 fair-only 的头文件、字段和符号依赖。
-构建完成后使用 `nginx -t` 和实际 upstream 流量验证配置。
+The shared-memory runtime entry is published through Nginx's native configuration commit callback. If loading fails, the old entry remains active, and replacement workers continue to use the valid configuration. After a successful reload, old requests drain according to native Nginx rules.
+
+## Joint Build with Health Checks
+
+Active health-check integration requires a joint static build:
+
+```bash
+git clone https://github.com/nginx/nginx.git
+git clone https://github.com/Akvicor/nginx-healthcheck-module.git
+git clone https://github.com/Akvicor/nginx-upstream-fair.git
+
+cd nginx
+git checkout release-1.26.3
+git apply ../nginx-healthcheck-module/nginx_healthcheck_for_nginx_1.26+.patch
+./auto/configure \
+    --with-stream \
+    --add-module=../nginx-healthcheck-module \
+    --add-module=../nginx-upstream-fair
+make
+```
+
+`NGX_HTTP_UPSTREAM_CHECK` isolates healthcheck-only headers, fields, and symbols from fair-only builds.
+
+## Verification
+
+After building, run `nginx -t` and verify the configuration with real upstream traffic.
