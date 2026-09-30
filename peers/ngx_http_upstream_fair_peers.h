@@ -4,25 +4,7 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
-/* 在用计数、被动失败和权重属于实际选中的组及后端。 */
-typedef struct {
-    ngx_uint_t nreq;
-    ngx_uint_t total_req;
-    ngx_uint_t last_req_id;
-    ngx_uint_t fails;
-    ngx_uint_t current_weight;
-    time_t accessed;
-} ngx_http_upstream_fair_shared_t;
-
-typedef struct {
-    ngx_rbtree_node_t node;
-    ngx_uint_t generation;
-    uintptr_t peers;
-    ngx_uint_t total_nreq;
-    ngx_uint_t total_requests;
-    ngx_atomic_t lock;
-    ngx_http_upstream_fair_shared_t stats[1];
-} ngx_http_upstream_fair_shm_block_t;
+#include "../shm/ngx_http_upstream_fair_shm.h"
 
 /* 业务地址来自配置池；检查索引随整个 peer 排序。 */
 typedef struct {
@@ -32,6 +14,7 @@ typedef struct {
     ngx_str_t name;
     ngx_uint_t weight;
     ngx_uint_t max_fails;
+    ngx_uint_t max_conns;
     time_t fail_timeout;
     ngx_uint_t down:1;
 #if (NGX_HTTP_UPSTREAM_CHECK)
@@ -42,12 +25,10 @@ typedef struct {
 #endif
 } ngx_http_upstream_fair_peer_t;
 
-/* 主备共享相同调度参数，每组拥有独立游标和按需统计块。 */
-typedef struct ngx_http_upstream_fair_peers_s ngx_http_upstream_fair_peers_t;
+/* 主备共享相同调度参数，每组拥有独立游标与加载期分配的统计块。 */
 struct ngx_http_upstream_fair_peers_s {
     ngx_http_upstream_fair_shm_block_t *shared;
     ngx_uint_t current;
-    ngx_uint_t size_err:1;
     ngx_uint_t no_rr:1;
     ngx_uint_t weight_mode:2;
     ngx_uint_t number;
